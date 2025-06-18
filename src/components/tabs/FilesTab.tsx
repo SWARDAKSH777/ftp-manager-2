@@ -3,7 +3,7 @@ import { supabase } from '@/integrations/supabase/client';
 import { useToast } from '@/hooks/use-toast';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Input } from '@/components/ui/input';
+import { Progress } from '@/components/ui/progress';
 import { 
   Breadcrumb,
   BreadcrumbEllipsis,
@@ -21,11 +21,12 @@ import {
   Trash2, 
   RefreshCw,
   ArrowLeft,
-  Plus,
   FolderPlus,
   AlertCircle,
-  Wifi
+  Wifi,
+  Lock
 } from 'lucide-react';
+import { useAuth } from '@/components/auth/AuthProvider';
 
 interface FtpFile {
   name: string;
@@ -36,114 +37,121 @@ interface FtpFile {
   permissions?: string;
 }
 
-interface FtpServer {
-  id: string;
-  name: string;
-  host: string;
-  port: number;
-  username: string;
-  protocol: string;
-  status: 'active' | 'inactive' | 'error';
-}
-
 const FilesTab = () => {
-  const [servers, setServers] = useState<FtpServer[]>([]);
-  const [selectedServer, setSelectedServer] = useState<FtpServer | null>(null);
+  const { user } = useAuth();
   const [currentPath, setCurrentPath] = useState('/');
   const [files, setFiles] = useState<FtpFile[]>([]);
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
-  const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'error' | null>(null);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [downloadProgress, setDownloadProgress] = useState(0);
+  const [userPermissions, setUserPermissions] = useState<any[]>([]);
+  const [server, setServer] = useState<any>(null);
   const { toast } = useToast();
 
-  // Fetch servers on component mount
   useEffect(() => {
-    fetchServers();
+    fetchServerAndPermissions();
   }, []);
 
-  // Fetch files when server or path changes
   useEffect(() => {
-    if (selectedServer) {
+    if (server && hasPathPermission(currentPath, 'read')) {
       fetchFiles();
     }
-  }, [selectedServer, currentPath]);
+  }, [currentPath, server, userPermissions]);
 
-  const fetchServers = async () => {
+  const fetchServerAndPermissions = async () => {
     try {
-      const { data, error } = await supabase
+      // Get the single FTP server
+      const { data: serverData, error: serverError } = await supabase
         .from('ftp_servers')
         .select('*')
-        .eq('status', 'active')
-        .order('name');
+        .limit(1)
+        .single();
 
-      if (error) throw error;
-      setServers(data || []);
-      if (data && data.length > 0 && !selectedServer) {
-        setSelectedServer(data[0]);
-      }
+      if (serverError) throw serverError;
+      setServer(serverData);
+
+      // Get user permissions
+      const { data: permissionsData, error: permError } = await supabase
+        .from('user_permissions')
+        .select('*')
+        .eq('user_id', user?.id)
+        .eq('server_id', serverData.id);
+
+      if (permError) throw permError;
+      setUserPermissions(permissionsData || []);
     } catch (error: any) {
+      console.error('Error fetching server/permissions:', error);
       toast({
-        title: "Failed to fetch servers",
-        description: error.message,
+        title: "Access Error",
+        description: "Unable to load server configuration",
         variant: "destructive"
       });
     }
   };
 
+  const hasPathPermission = (path: string, action: 'read' | 'write' | 'delete'): boolean => {
+    if (!userPermissions.length) return false;
+    
+    // Check for exact path match or parent path permissions
+    return userPermissions.some(perm => {
+      const permPath = perm.path.endsWith('/') ? perm.path.slice(0, -1) : perm.path;
+      const checkPath = path.endsWith('/') ? path.slice(0, -1) : path;
+      
+      const hasAccess = checkPath.startsWith(permPath) || permPath === '*';
+      
+      switch (action) {
+        case 'read':
+          return hasAccess && perm.can_read;
+        case 'write':
+          return hasAccess && perm.can_write;
+        case 'delete':
+          return hasAccess && perm.can_delete;
+        default:
+          return false;
+      }
+    });
+  };
+
   const fetchFiles = async () => {
-    if (!selectedServer) return;
+    if (!server || !hasPathPermission(currentPath, 'read')) {
+      setFiles([]);
+      return;
+    }
     
     setLoading(true);
-    setConnectionStatus('connecting');
     
     try {
-      console.log(`Fetching files from ${selectedServer.name} at path: ${currentPath}`);
-      
       const { data, error } = await supabase.functions.invoke('ftp-operations', {
         body: {
           action: 'list_files',
-          serverId: selectedServer.id,
+          serverId: server.id,
           path: currentPath
         }
       });
 
-      if (error) {
-        console.error('Supabase function error:', error);
-        throw error;
-      }
-
-      console.log('FTP function response:', data);
+      if (error) throw error;
 
       if (data.success) {
-        setFiles(data.files || []);
-        setConnectionStatus('connected');
+        // Filter files based on user permissions
+        const filteredFiles = data.files.filter((file: FtpFile) => {
+          return hasPathPermission(file.path, 'read');
+        });
+        
+        setFiles(filteredFiles);
         
         toast({
-          title: "Files loaded successfully",
-          description: `Found ${data.files?.length || 0} items in ${currentPath}`
+          title: "Files loaded",
+          description: `Found ${filteredFiles.length} accessible items`
         });
       } else {
-        setConnectionStatus('error');
         throw new Error(data.error || 'Failed to list files');
       }
     } catch (error: any) {
       console.error('Failed to fetch files:', error);
-      setConnectionStatus('error');
-      
-      let errorMessage = error.message;
-      
-      // Handle specific FTP errors
-      if (errorMessage.includes('Data connection failed')) {
-        errorMessage = 'Network connection failed. Your FTP server may not support passive mode from this network. Try using active mode or check your firewall settings.';
-      } else if (errorMessage.includes('timeout')) {
-        errorMessage = 'Connection timed out. Please check your server settings and network connection.';
-      } else if (errorMessage.includes('Authentication failed')) {
-        errorMessage = 'Login failed. Please check your username and password.';
-      }
-      
       toast({
-        title: "Failed to fetch files",
-        description: errorMessage,
+        title: "Failed to load files",
+        description: error.message,
         variant: "destructive"
       });
       setFiles([]);
@@ -155,11 +163,9 @@ const FilesTab = () => {
   const handleFileClick = (file: FtpFile) => {
     if (file.type === 'directory') {
       if (file.name === '..') {
-        // Navigate to parent directory
         const parentPath = currentPath.split('/').slice(0, -1).join('/') || '/';
         setCurrentPath(parentPath);
       } else {
-        // Navigate into directory
         setCurrentPath(file.path);
       }
     }
@@ -167,9 +173,18 @@ const FilesTab = () => {
 
   const handleUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
-    if (!file || !selectedServer) return;
+    if (!file || !server || !hasPathPermission(currentPath, 'write')) {
+      toast({
+        title: "Upload not allowed",
+        description: "You don't have write permission for this location",
+        variant: "destructive"
+      });
+      return;
+    }
 
     setUploading(true);
+    setUploadProgress(0);
+    
     try {
       const reader = new FileReader();
       reader.onload = async (e) => {
@@ -177,12 +192,15 @@ const FilesTab = () => {
           const content = e.target?.result as ArrayBuffer;
           const remotePath = `${currentPath}/${file.name}`.replace('//', '/');
 
-          console.log(`Uploading ${file.name} to ${remotePath}`);
+          // Simulate progress
+          const progressInterval = setInterval(() => {
+            setUploadProgress(prev => Math.min(prev + 10, 90));
+          }, 200);
 
           const { data, error } = await supabase.functions.invoke('ftp-operations', {
             body: {
               action: 'upload_file',
-              serverId: selectedServer.id,
+              serverId: server.id,
               fileData: {
                 fileName: file.name,
                 size: file.size,
@@ -193,19 +211,21 @@ const FilesTab = () => {
             }
           });
 
+          clearInterval(progressInterval);
+          setUploadProgress(100);
+
           if (error) throw error;
 
           if (data.success) {
             toast({
-              title: "File uploaded successfully",
-              description: `${file.name} has been uploaded to ${remotePath}`
+              title: "Upload successful",
+              description: `${file.name} has been uploaded`
             });
-            fetchFiles(); // Refresh file list
+            fetchFiles();
           } else {
             throw new Error(data.error || 'Upload failed');
           }
         } catch (uploadError: any) {
-          console.error('Upload failed:', uploadError);
           toast({
             title: "Upload failed",
             description: uploadError.message,
@@ -213,6 +233,7 @@ const FilesTab = () => {
           });
         } finally {
           setUploading(false);
+          setUploadProgress(0);
         }
       };
       reader.readAsArrayBuffer(file);
@@ -223,25 +244,35 @@ const FilesTab = () => {
         variant: "destructive"
       });
       setUploading(false);
+      setUploadProgress(0);
     }
   };
 
   const handleDownload = async (file: FtpFile) => {
-    if (!selectedServer || file.type === 'directory') return;
+    if (!server || file.type === 'directory') return;
 
+    setDownloadProgress(0);
+    
     try {
+      // Simulate progress
+      const progressInterval = setInterval(() => {
+        setDownloadProgress(prev => Math.min(prev + 15, 90));
+      }, 300);
+
       const { data, error } = await supabase.functions.invoke('ftp-operations', {
         body: {
           action: 'download_file',
-          serverId: selectedServer.id,
+          serverId: server.id,
           path: file.path
         }
       });
 
+      clearInterval(progressInterval);
+      setDownloadProgress(100);
+
       if (error) throw error;
 
       if (data.success && data.content) {
-        // Create download link
         const content = atob(data.content);
         const blob = new Blob([content], { type: 'application/octet-stream' });
         const url = URL.createObjectURL(blob);
@@ -252,7 +283,7 @@ const FilesTab = () => {
         URL.revokeObjectURL(url);
 
         toast({
-          title: "File downloaded",
+          title: "Download complete",
           description: `${file.name} has been downloaded`
         });
       } else {
@@ -264,17 +295,28 @@ const FilesTab = () => {
         description: error.message,
         variant: "destructive"
       });
+    } finally {
+      setTimeout(() => setDownloadProgress(0), 1000);
     }
   };
 
   const handleDelete = async (file: FtpFile) => {
-    if (!selectedServer) return;
+    if (!server || !hasPathPermission(file.path, 'delete')) {
+      toast({
+        title: "Delete not allowed",
+        description: "You don't have delete permission for this item",
+        variant: "destructive"
+      });
+      return;
+    }
+
+    if (!confirm(`Are you sure you want to delete ${file.name}?`)) return;
 
     try {
       const { data, error } = await supabase.functions.invoke('ftp-operations', {
         body: {
           action: 'delete_file',
-          serverId: selectedServer.id,
+          serverId: server.id,
           path: file.path
         }
       });
@@ -286,7 +328,7 @@ const FilesTab = () => {
           title: "File deleted",
           description: `${file.name} has been deleted`
         });
-        fetchFiles(); // Refresh file list
+        fetchFiles();
       } else {
         throw new Error(data.error || 'Delete failed');
       }
@@ -299,77 +341,12 @@ const FilesTab = () => {
     }
   };
 
-  const handleCreateDirectory = async () => {
-    const dirName = prompt('Enter directory name:');
-    if (!dirName || !selectedServer) return;
-
-    const dirPath = `${currentPath}/${dirName}`.replace('//', '/');
-
-    try {
-      const { data, error } = await supabase.functions.invoke('ftp-operations', {
-        body: {
-          action: 'create_directory',
-          serverId: selectedServer.id,
-          path: dirPath
-        }
-      });
-
-      if (error) throw error;
-
-      if (data.success) {
-        toast({
-          title: "Directory created",
-          description: `${dirName} has been created`
-        });
-        fetchFiles(); // Refresh file list
-      } else {
-        throw new Error(data.error || 'Directory creation failed');
-      }
-    } catch (error: any) {
-      toast({
-        title: "Create directory failed",
-        description: error.message,
-        variant: "destructive"
-      });
-    }
-  };
-
   const formatFileSize = (bytes: number) => {
-    if (bytes === 0) return '0 Bytes';
+    if (bytes === 0) return '0 B';
     const k = 1024;
-    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+    const sizes = ['B', 'KB', 'MB', 'GB'];
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-  };
-
-  const renderConnectionStatus = () => {
-    if (!connectionStatus) return null;
-    
-    switch (connectionStatus) {
-      case 'connecting':
-        return (
-          <div className="flex items-center text-yellow-600 text-sm mb-4">
-            <RefreshCw className="h-4 w-4 animate-spin mr-2" />
-            Connecting to server...
-          </div>
-        );
-      case 'connected':
-        return (
-          <div className="flex items-center text-green-600 text-sm mb-4">
-            <Wifi className="h-4 w-4 mr-2" />
-            Connected to {selectedServer?.name}
-          </div>
-        );
-      case 'error':
-        return (
-          <div className="flex items-center text-red-600 text-sm mb-4">
-            <AlertCircle className="h-4 w-4 mr-2" />
-            Connection failed. Check logs for details.
-          </div>
-        );
-      default:
-        return null;
-    }
   };
 
   const renderBreadcrumb = () => {
@@ -408,176 +385,174 @@ const FilesTab = () => {
     );
   };
 
+  if (!server) {
+    return (
+      <div className="p-4">
+        <Card>
+          <CardContent className="text-center py-12">
+            <AlertCircle className="h-12 w-12 text-gray-400 mx-auto mb-4" />
+            <h3 className="text-lg font-medium text-gray-900 mb-2">No Server Configured</h3>
+            <p className="text-gray-600">Contact your administrator to set up the FTP server</p>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
+  if (!hasPathPermission(currentPath, 'read')) {
+    return (
+      <div className="p-4">
+        <Card>
+          <CardContent className="text-center py-12">
+            <Lock className="h-12 w-12 text-red-400 mx-auto mb-4" />
+            <h3 className="text-lg font-medium text-gray-900 mb-2">Access Denied</h3>
+            <p className="text-gray-600">You don't have permission to access this location</p>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
   return (
-    <div className="p-6">
-      <div className="flex items-center justify-between mb-6">
+    <div className="p-4 space-y-4">
+      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900">File Browser</h1>
-          <p className="text-gray-600">Browse and manage files on your FTP servers</p>
+          <h1 className="text-xl font-bold text-gray-900">My Files</h1>
+          <p className="text-sm text-gray-600">Browse your accessible files</p>
         </div>
-        <div className="flex space-x-2">
-          {selectedServer && (
-            <>
+        <div className="flex flex-wrap gap-2">
+          {hasPathPermission(currentPath, 'write') && (
+            <label>
               <Button
                 variant="outline"
-                onClick={handleCreateDirectory}
-                disabled={loading}
+                disabled={uploading || loading}
+                asChild
+                size="sm"
               >
-                <FolderPlus className="mr-2 h-4 w-4" />
-                New Folder
+                <span>
+                  <Upload className="mr-2 h-4 w-4" />
+                  {uploading ? 'Uploading...' : 'Upload'}
+                </span>
               </Button>
-              <label>
-                <Button
-                  variant="outline"
-                  disabled={uploading || loading}
-                  asChild
-                >
-                  <span>
-                    <Upload className="mr-2 h-4 w-4" />
-                    {uploading ? 'Uploading...' : 'Upload File'}
-                  </span>
-                </Button>
-                <input
-                  type="file"
-                  onChange={handleUpload}
-                  className="hidden"
-                  disabled={uploading || loading}
-                />
-              </label>
-              <Button
-                variant="outline"
-                onClick={fetchFiles}
-                disabled={loading}
-              >
-                <RefreshCw className={`mr-2 h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
-                Refresh
-              </Button>
-            </>
+              <input
+                type="file"
+                onChange={handleUpload}
+                className="hidden"
+                disabled={uploading || loading}
+              />
+            </label>
           )}
+          <Button
+            variant="outline"
+            onClick={fetchFiles}
+            disabled={loading}
+            size="sm"
+          >
+            <RefreshCw className={`mr-2 h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
+            Refresh
+          </Button>
         </div>
       </div>
 
-      {servers.length === 0 ? (
+      {/* Progress Bars */}
+      {uploadProgress > 0 && (
         <Card>
-          <CardContent className="text-center py-12">
-            <h3 className="text-lg font-medium text-gray-900 mb-2">No Active Servers</h3>
-            <p className="text-gray-600">Connect to an FTP server first to browse files</p>
+          <CardContent className="pt-6">
+            <div className="space-y-2">
+              <div className="flex justify-between text-sm">
+                <span>Uploading...</span>
+                <span>{uploadProgress}%</span>
+              </div>
+              <Progress value={uploadProgress} />
+            </div>
           </CardContent>
         </Card>
-      ) : (
-        <div className="space-y-6">
-          {/* Server Selection */}
-          <Card>
-            <CardHeader>
-              <CardTitle>Select Server</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="flex flex-wrap gap-2">
-                {servers.map((server) => (
-                  <Button
-                    key={server.id}
-                    variant={selectedServer?.id === server.id ? "default" : "outline"}
-                    onClick={() => setSelectedServer(server)}
-                    className="flex items-center"
-                  >
-                    {server.name}
-                  </Button>
-                ))}
-              </div>
-            </CardContent>
-          </Card>
-
-          {selectedServer && (
-            <Card>
-              <CardHeader>
-                <div className="flex items-center justify-between">
-                  <CardTitle className="flex items-center">
-                    <Folder className="mr-2 h-5 w-5" />
-                    {selectedServer.name}
-                  </CardTitle>
-                  {renderBreadcrumb()}
-                </div>
-              </CardHeader>
-              <CardContent>
-                {renderConnectionStatus()}
-                
-                {loading ? (
-                  <div className="text-center py-12">
-                    <RefreshCw className="h-8 w-8 animate-spin mx-auto mb-4" />
-                    <p>Loading files...</p>
-                  </div>
-                ) : files.length === 0 ? (
-                  <div className="text-center py-12">
-                    <Folder className="h-12 w-12 text-gray-400 mx-auto mb-4" />
-                    <h3 className="text-lg font-medium text-gray-900 mb-2">
-                      {connectionStatus === 'error' ? 'Connection Failed' : 'Empty Directory'}
-                    </h3>
-                    <p className="text-gray-600">
-                      {connectionStatus === 'error' 
-                        ? 'Unable to connect to the FTP server. Please check your server configuration and try again.' 
-                        : 'This directory is empty'
-                      }
-                    </p>
-                    {connectionStatus === 'error' && (
-                      <Button
-                        onClick={fetchFiles}
-                        variant="outline"
-                        className="mt-4"
-                      >
-                        <RefreshCw className="mr-2 h-4 w-4" />
-                        Retry Connection
-                      </Button>
-                    )}
-                  </div>
-                ) : (
-                  <div className="space-y-2">
-                    {files.map((file, index) => (
-                      <div
-                        key={index}
-                        className="flex items-center justify-between p-3 rounded-lg border hover:bg-gray-50 cursor-pointer"
-                        onClick={() => handleFileClick(file)}
-                      >
-                        <div className="flex items-center space-x-3">
-                          {file.type === 'directory' ? (
-                            <Folder className="h-5 w-5 text-blue-600" />
-                          ) : (
-                            <File className="h-5 w-5 text-gray-600" />
-                          )}
-                          <div>
-                            <p className="font-medium">{file.name}</p>
-                            <p className="text-sm text-gray-500">
-                              {formatFileSize(file.size)} • {new Date(file.modified_at).toLocaleString()}
-                            </p>
-                          </div>
-                        </div>
-                        
-                        {file.type === 'file' && file.name !== '..' && (
-                          <div className="flex space-x-2" onClick={(e) => e.stopPropagation()}>
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              onClick={() => handleDownload(file)}
-                            >
-                              <Download className="h-4 w-4" />
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              onClick={() => handleDelete(file)}
-                            >
-                              <Trash2 className="h-4 w-4" />
-                            </Button>
-                          </div>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </CardContent>
-            </Card>
-          )}
-        </div>
       )}
+
+      {downloadProgress > 0 && (
+        <Card>
+          <CardContent className="pt-6">
+            <div className="space-y-2">
+              <div className="flex justify-between text-sm">
+                <span>Downloading...</span>
+                <span>{downloadProgress}%</span>
+              </div>
+              <Progress value={downloadProgress} />
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      <Card>
+        <CardHeader>
+          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+            <CardTitle className="flex items-center text-lg">
+              <Folder className="mr-2 h-5 w-5" />
+              {server.name}
+            </CardTitle>
+            {renderBreadcrumb()}
+          </div>
+        </CardHeader>
+        <CardContent>
+          {loading ? (
+            <div className="text-center py-12">
+              <RefreshCw className="h-8 w-8 animate-spin mx-auto mb-4" />
+              <p>Loading files...</p>
+            </div>
+          ) : files.length === 0 ? (
+            <div className="text-center py-12">
+              <Folder className="h-12 w-12 text-gray-400 mx-auto mb-4" />
+              <h3 className="text-lg font-medium text-gray-900 mb-2">No Files Found</h3>
+              <p className="text-gray-600">This directory is empty or you don't have access</p>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {files.map((file, index) => (
+                <div
+                  key={index}
+                  className="flex items-center justify-between p-3 rounded-lg border hover:bg-gray-50 cursor-pointer"
+                  onClick={() => handleFileClick(file)}
+                >
+                  <div className="flex items-center space-x-3 flex-1 min-w-0">
+                    {file.type === 'directory' ? (
+                      <Folder className="h-5 w-5 text-blue-600 flex-shrink-0" />
+                    ) : (
+                      <File className="h-5 w-5 text-gray-600 flex-shrink-0" />
+                    )}
+                    <div className="min-w-0 flex-1">
+                      <p className="font-medium truncate">{file.name}</p>
+                      <p className="text-xs text-gray-500">
+                        {formatFileSize(file.size)} • {new Date(file.modified_at).toLocaleDateString()}
+                      </p>
+                    </div>
+                  </div>
+                  
+                  {file.type === 'file' && file.name !== '..' && (
+                    <div className="flex space-x-1" onClick={(e) => e.stopPropagation()}>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => handleDownload(file)}
+                      >
+                        <Download className="h-4 w-4" />
+                      </Button>
+                      {hasPathPermission(file.path, 'delete') && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => handleDelete(file)}
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </Button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </CardContent>
+      </Card>
     </div>
   );
 };
